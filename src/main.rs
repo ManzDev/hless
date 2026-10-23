@@ -8,6 +8,7 @@ mod app;
 mod htmlparser;
 mod row;
 mod screen;
+mod sniff;
 
 use app::App;
 
@@ -16,11 +17,15 @@ use app::App;
     name = "hless",
     version,
     about = "A pager for HTML files with nested folding",
-    after_help = "Ejemplos:\n  hless page.html\n  cat page.html | hless\n  curl https://example.com | hless"
+    after_help = "Ejemplos:\n  hless page.html\n  cat page.html | hless\n  curl https://example.com | hless\n  curl -i https://example.com | hless   (Ctrl+O: cabeceras HTTP)"
 )]
 struct Opt {
     /// Input file. Reads from stdin if not provided or '-' is specified.
     input: Option<PathBuf>,
+
+    /// Muestra la entrada aunque no parezca HTML.
+    #[arg(short, long)]
+    force: bool,
 }
 
 fn main() {
@@ -34,27 +39,107 @@ fn main() {
         std::process::exit(0);
     }
 
-    let (input_string, input_filename) = match get_input_and_filename(&opt) {
+    // Aviso si el fichero tiene una extensión que no es HTML (no bloquea).
+    if let Some(path) = &opt.input {
+        if path.as_os_str() != "-" {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ok = matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "html" | "htm" | "xhtml" | "svg"
+                );
+                if !ok {
+                    eprintln!(
+                        "hless: aviso: '{}' no tiene extensión HTML; se mostrará igualmente",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    let (raw, filename) = match get_input_and_filename(&opt) {
         Ok(val) => val,
         Err(err) => {
-            eprintln!("Error: {err}");
+            if err.kind() == io::ErrorKind::InvalidData {
+                eprintln!(
+                    "hless: la entrada no es texto UTF-8 (¿contenido comprimido o binario?)"
+                );
+            } else {
+                eprintln!("hless: {err}");
+            }
             std::process::exit(1);
         }
     };
 
-    // Si stdout no es un terminal, no podemos abrir TUI: se vuelca el HTML tal cual.
+    // Si stdout no es un terminal, no podemos abrir TUI: se vuelca tal cual.
     if !isatty::stdout_isatty() {
-        print!("{input_string}");
+        print!("{raw}");
         std::process::exit(0);
     }
 
-    let mut app = match App::new(&input_string, &input_filename) {
-        Ok(app) => app,
+    // Clasificar la entrada.
+    let kind = sniff::sniff(&raw);
+    let mut headers = None;
+    let mut notice = None;
+    let mut open_headers = false;
+    let mut empty_http_body = false;
+
+    let source: String = match kind {
+        sniff::InputKind::Html => raw.clone(),
+        sniff::InputKind::Http(resp) => {
+            let sniff::HttpResponse { meta, body } = resp;
+            empty_http_body = body.trim().is_empty();
+            if empty_http_body {
+                open_headers = true;
+                notice = Some(
+                    "Respuesta HTTP sin cuerpo (p. ej. HEAD). Pulsa Ctrl+O para ver las cabeceras."
+                        .to_string(),
+                );
+            }
+            headers = Some(meta);
+            body
+        }
+        sniff::InputKind::Empty => {
+            eprintln!("hless: la entrada está vacía");
+            std::process::exit(2);
+        }
+        sniff::InputKind::Other => {
+            if !opt.force {
+                eprintln!("hless: la entrada no parece HTML (no empieza por '<').");
+                eprintln!("        usa --force para mostrarla igualmente.");
+                std::process::exit(2);
+            }
+            raw.clone()
+        }
+    };
+
+    let is_http = headers.is_some();
+    let node = match htmlparser::parse_html(&source) {
+        Ok(node) => node,
         Err(err) => {
-            eprintln!("Error: {err}");
+            eprintln!("hless: {err}");
             std::process::exit(1);
         }
     };
+
+    // Comprobación estructural: debe haber al menos una etiqueta real.
+    if !opt.force && !empty_http_body && !htmlparser::has_real_element(&node) {
+        if is_http {
+            eprintln!("hless: el cuerpo de la respuesta HTTP no parece HTML.");
+        } else {
+            eprintln!("hless: la entrada no parece HTML (no contiene etiquetas).");
+        }
+        eprintln!("        usa --force para mostrarla igualmente.");
+        std::process::exit(2);
+    }
+
+    let mut app = App::from_html(node, &filename);
+    if let Some(meta) = headers {
+        app.set_headers(meta, open_headers);
+    }
+    if let Some(msg) = notice {
+        app.set_notice(msg);
+    }
 
     // Fuente del teclado: stdin si es un terminal; si la entrada vino por pipe
     // (p. ej. `curl ... | hless`), se lee del terminal controlando (/dev/tty),
@@ -66,7 +151,7 @@ fn main() {
             Ok(f) => Box::new(BufReader::new(f)),
             Err(_) => {
                 // Sin terminal para el teclado no hay TUI posible: se vuelca.
-                print!("{input_string}");
+                print!("{raw}");
                 std::process::exit(0);
             }
         }

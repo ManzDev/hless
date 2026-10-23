@@ -382,6 +382,162 @@ pub fn bar(left: &str, right: &str, width: usize, bg: &str) -> String {
     out
 }
 
+/// Línea del popup de cabeceras: texto suelto o par clave/valor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PopupLine {
+    /// Texto sin estructura (p. ej. la status line).
+    Text(String),
+    /// `clave: valor`.
+    Kv { key: String, value: String },
+}
+
+impl PopupLine {
+    /// Ancho visible de la línea completa.
+    pub fn width(&self) -> usize {
+        match self {
+            PopupLine::Text(s) => UnicodeWidthStr::width(s.as_str()),
+            PopupLine::Kv { key, value } => {
+                UnicodeWidthStr::width(key.as_str()) + 2 + UnicodeWidthStr::width(value.as_str())
+            }
+        }
+    }
+
+    /// Segmentos (texto, color) que componen la línea.
+    fn segments(&self) -> Vec<(String, &'static str)> {
+        match self {
+            PopupLine::Text(s) => vec![(s.clone(), FG_ACCENT)],
+            PopupLine::Kv { key, value } => vec![
+                (key.clone(), FG_KEY),
+                (": ".to_string(), FG_SEP),
+                (value.clone(), FG_STRONG),
+            ],
+        }
+    }
+}
+
+/// Recorta segmentos con color: salta `skip` columnas y muestra hasta `max_w`.
+fn slice_segments(segments: &[(String, &'static str)], skip: usize, max_w: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut written = 0usize;
+
+    for (text, color) in segments {
+        let mut color_set = false;
+        for ch in text.chars() {
+            let w = char_width(ch);
+            if col < skip {
+                col += w;
+                continue;
+            }
+            if written + w > max_w {
+                out.push_str(RESET);
+                return out;
+            }
+            if !color_set {
+                out.push_str(color);
+                color_set = true;
+            }
+            out.push(ch);
+            written += w;
+            col += w;
+        }
+    }
+    out.push_str(RESET);
+    out
+}
+
+/// Renderiza una ventana emergente con borde, ocupando exactamente
+/// `width x height`. `scroll` es la primera línea visible y `hscroll` el
+/// desplazamiento horizontal en columnas. La primera línea (status HTTP) se
+/// resalta y las cabeceras muestran la clave en otro color.
+pub fn render_popup(
+    title: &str,
+    lines: &[PopupLine],
+    width: usize,
+    height: usize,
+    scroll: usize,
+    hscroll: usize,
+) -> String {
+    let w = width.max(1);
+    if height == 0 {
+        return String::new();
+    }
+
+    let mut rows: Vec<String> = Vec::with_capacity(height);
+
+    if w >= 10 && height >= 3 {
+        let inner_w = w - 4;
+        let inner_h = height - 2;
+
+        // Borde superior con el título embebido.
+        let title_trunc = truncate_plain(title, w.saturating_sub(8));
+        let tw = UnicodeWidthStr::width(title_trunc.as_str());
+        let mut top = format!("╭─ {} ", title_trunc);
+        let fill = w.saturating_sub(tw + 5); // "╭─ " + título + " " + "╮"
+        top.push_str(&"─".repeat(fill));
+        top.push('╮');
+        rows.push(format!("{}{}{}{}", FG_ACCENT, top, RESET, CLEAR_EOL));
+
+        // Líneas de contenido, con scroll vertical y horizontal.
+        for i in 0..inner_h {
+            let idx = scroll + i;
+            let txt = match lines.get(idx) {
+                Some(line) => slice_segments(&line.segments(), hscroll, inner_w),
+                None => RESET.to_string(),
+            };
+            let vw = visible_width(&txt);
+            let pad = " ".repeat(inner_w.saturating_sub(vw));
+            rows.push(format!(
+                "{b}│ {r}{txt}{pad}{b} │{r}{k}",
+                b = FG_SEP,
+                r = RESET,
+                txt = txt,
+                pad = pad,
+                k = CLEAR_EOL
+            ));
+        }
+
+        // Borde inferior.
+        let bottom = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
+        rows.push(format!("{}{}{}{}", FG_SEP, bottom, RESET, CLEAR_EOL));
+    } else {
+        // Espacio demasiado pequeño: texto plano truncado.
+        for i in 0..height {
+            let txt = match lines.get(scroll + i) {
+                Some(line) => slice_segments(&line.segments(), hscroll, w),
+                None => RESET.to_string(),
+            };
+            rows.push(format!("{}{}", txt, CLEAR_EOL));
+        }
+    }
+
+    let mut out = rows.join("\r\n");
+    out.push_str("\r\n");
+    out
+}
+
+/// Muestra un aviso en la primera línea del área de contenido (resto vacío).
+pub fn render_notice(msg: &str, width: usize, height: usize) -> String {
+    let w = width.max(1);
+    if height == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for i in 0..height {
+        if i > 0 {
+            out.push_str("\r\n");
+        }
+        if i == 0 {
+            let txt = truncate_plain(msg, w.saturating_sub(1));
+            out.push_str(&format!(" {}{}{}{}", FG_DIM, txt, RESET, CLEAR_EOL));
+        } else {
+            out.push_str(CLEAR_EOL);
+        }
+    }
+    out.push_str("\r\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +614,54 @@ mod tests {
         let escapes = out.matches('\x1b').count();
         assert_eq!(escapes, 4, "dos códigos de estilo + RESET + limpiar-línea: {out:?}");
         assert!(strip_ansi(&out).contains("<div class=\"container\">"));
+    }
+
+    #[test]
+    fn popup_fits_width_and_height() {
+        let lines: Vec<PopupLine> = (0..10)
+            .map(|i| PopupLine::Kv {
+                key: format!("header-{i}"),
+                value: "x".repeat(80),
+            })
+            .collect();
+        let out = render_popup("HTTP headers", &lines, 40, 6, 0, 0);
+        let ls: Vec<&str> = out.lines().collect();
+        assert_eq!(ls.len(), 6, "debe ocupar exactamente la altura");
+        for l in &ls {
+            assert!(visible_width(l) <= 40, "línea demasiado ancha: {l:?}");
+        }
+        // Con el borde dibujado, título presente
+        assert!(strip_ansi(&out).contains("HTTP headers"));
+        assert!(strip_ansi(&out).contains('╭'));
+        assert!(strip_ansi(&out).contains('╯'));
+    }
+
+    #[test]
+    fn popup_colors_the_key_and_hscrolls() {
+        let lines = vec![PopupLine::Kv {
+            key: "content-type".to_string(),
+            value: "text/html; charset=utf-8".to_string(),
+        }];
+        // Sin scroll horizontal: la clave va en color de tecla (naranja 216)
+        let out = render_popup("t", &lines, 40, 3, 0, 0);
+        assert!(out.contains(FG_KEY), "la clave debe ir resaltada");
+        assert!(strip_ansi(&out).contains("content-type: text/html"));
+
+        // Con scroll horizontal no se sale del ancho y se recorta por la izquierda
+        let out = render_popup("t", &lines, 20, 3, 0, 10);
+        for l in out.lines() {
+            assert!(visible_width(l) <= 20);
+        }
+        let plain = strip_ansi(&out);
+        assert!(!plain.contains("content-type"), "se ha desplazado: {plain:?}");
+        assert!(plain.contains(": text/html"), "queda la cola visible: {plain:?}");
+    }
+
+    #[test]
+    fn popup_minimal_space_falls_back_to_plain() {
+        let lines = vec![PopupLine::Text("HTTP/2 200".to_string())];
+        let out = render_popup("t", &lines, 8, 2, 0, 0);
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]

@@ -1,7 +1,10 @@
 use std::io::{Read, Write};
+use crate::htmlparser::HtmlNode;
+#[cfg(test)]
 use crate::htmlparser;
 use crate::row::FlatHtml;
 use crate::screen::{self, Colors};
+use crate::sniff::HttpHeaders;
 
 pub struct App {
     pub flat_html: FlatHtml,
@@ -20,19 +23,36 @@ pub struct App {
     active_match: Option<usize>,
     /// Foco al empezar a buscar (para restaurarlo si se cancela).
     search_origin: usize,
+    /// Cabeceras HTTP de la entrada (si venía de `curl -i`/`-I`).
+    headers: Option<HttpHeaders>,
+    /// Si el popup de cabeceras está abierto.
+    show_headers: bool,
+    /// Primera línea visible del popup de cabeceras.
+    header_scroll: usize,
+    /// Desplazamiento horizontal del popup de cabeceras (columnas).
+    header_hscroll: usize,
+    /// Aviso a mostrar cuando no hay contenido (p. ej. respuesta HTTP sin cuerpo).
+    notice: Option<String>,
     colors: Colors,
 }
 
 impl App {
+    /// Constructor de conveniencia para tests: parsea y delega en `from_html`.
+    #[cfg(test)]
     pub fn new(input: &str, filename: &str) -> Result<Self, String> {
         let html = htmlparser::parse_html(input)?;
+        Ok(Self::from_html(html, filename))
+    }
+
+    /// Construye la app a partir de un árbol ya parseado.
+    pub fn from_html(html: HtmlNode, filename: &str) -> Self {
         let mut flat_html = FlatHtml::from_html(&html);
 
         // Por defecto todo arranca plegado: se van descubriendo los niveles al
         // expandir (→). El foco queda en <html>.
         let focus = flat_html.collapse_all_default();
 
-        Ok(App {
+        App {
             flat_html,
             filename: filename.to_string(),
             focus,
@@ -42,8 +62,27 @@ impl App {
             matches: Vec::new(),
             active_match: None,
             search_origin: focus,
+            headers: None,
+            show_headers: false,
+            header_scroll: 0,
+            header_hscroll: 0,
+            notice: None,
             colors: Colors::new(),
-        })
+        }
+    }
+
+    /// Adjunta cabeceras HTTP. `open` abre el popup directamente (útil cuando
+    /// la respuesta no trae cuerpo, p. ej. `curl -I`).
+    pub fn set_headers(&mut self, headers: HttpHeaders, open: bool) {
+        self.headers = Some(headers);
+        self.show_headers = open;
+        self.header_scroll = 0;
+        self.header_hscroll = 0;
+    }
+
+    /// Aviso mostrado en el área de contenido cuando no hay árbol que pintar.
+    pub fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
     }
 
     pub fn run(&mut self, keys: &mut dyn Read, stdout: &mut dyn Write) {
@@ -63,6 +102,11 @@ impl App {
 
     /// Aplica una tecla. Devuelve `true` si hay que salir.
     fn handle_key(&mut self, key: Key) -> bool {
+        // Popup de cabeceras abierto: sus teclas mandan.
+        if self.show_headers {
+            return self.handle_popup_key(key);
+        }
+
         // Modo entrada de búsqueda: los caracteres van al texto buscado.
         if self.search_input.is_some() {
             match key {
@@ -106,6 +150,45 @@ impl App {
             Key::Char('/') => self.start_search(),
             Key::Char('n') => self.search_next(),
             Key::Char('N') => self.search_prev(),
+            Key::ToggleHeaders if self.headers.is_some() => {
+                self.show_headers = !self.show_headers;
+                self.header_scroll = 0;
+                self.header_hscroll = 0;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Teclas mientras el popup de cabeceras está visible.
+    fn handle_popup_key(&mut self, key: Key) -> bool {
+        let page = self.page_step().saturating_sub(2).max(1);
+        match key {
+            Key::Char('q') | Key::Char('Q') => return true,
+            Key::ToggleHeaders | Key::Escape => self.show_headers = false,
+            Key::Up | Key::Char('k') => {
+                self.header_scroll = self.header_scroll.saturating_sub(1)
+            }
+            Key::Down | Key::Char('j') => {
+                self.header_scroll = self.header_scroll.saturating_add(1)
+            }
+            Key::PageUp | Key::Char('b') | Key::Char('B') => {
+                self.header_scroll = self.header_scroll.saturating_sub(page)
+            }
+            Key::PageDown | Key::Char(' ') | Key::Char('f') => {
+                self.header_scroll = self.header_scroll.saturating_add(page)
+            }
+            Key::Left | Key::Char('h') => {
+                self.header_hscroll = self.header_hscroll.saturating_sub(1)
+            }
+            Key::Right | Key::Char('l') => {
+                self.header_hscroll = self.header_hscroll.saturating_add(1)
+            }
+            Key::Home | Key::Char('g') => {
+                self.header_scroll = 0;
+                self.header_hscroll = 0;
+            }
+            Key::End | Key::Char('G') => self.header_scroll = usize::MAX,
             _ => {}
         }
         false
@@ -138,21 +221,76 @@ impl App {
         write!(stdout, "{}", termion::cursor::Goto(1, 1)).unwrap();
         write!(stdout, "{}", termion::cursor::Hide).unwrap();
 
-        // Render HTML ajustado al ancho/alto reales, sin wrapping
-        let active_row = self.active_match.and_then(|i| self.matches.get(i).copied());
-        let hits = screen::Hits {
-            matches: &self.matches,
-            active: active_row,
+        // Contenido base: árbol o aviso.
+        let base = if self.flat_html.rows.is_empty() {
+            match &self.notice {
+                Some(msg) => screen::render_notice(msg, width, content_height),
+                None => screen::render_html(
+                    &self.flat_html,
+                    &self.colors,
+                    width,
+                    content_height,
+                    self.focus,
+                    start,
+                    screen::Hits {
+                        matches: &self.matches,
+                        active: self.active_match.and_then(|i| self.matches.get(i).copied()),
+                    },
+                ),
+            }
+        } else {
+            let active_row = self.active_match.and_then(|i| self.matches.get(i).copied());
+            let hits = screen::Hits {
+                matches: &self.matches,
+                active: active_row,
+            };
+            screen::render_html(
+                &self.flat_html,
+                &self.colors,
+                width,
+                content_height,
+                self.focus,
+                start,
+                hits,
+            )
         };
-        let output = screen::render_html(
-            &self.flat_html,
-            &self.colors,
-            width,
-            content_height,
-            self.focus,
-            start,
-            hits,
-        );
+
+        // Popup de cabeceras: caja compacta centrada sobre el contenido.
+        let output = if self.show_headers {
+            match &self.headers {
+                Some(meta) => {
+                    let lines = header_lines(meta);
+                    let box_h = (lines.len() + 2).min(content_height).max(content_height.min(3));
+                    let inner_h = box_h.saturating_sub(2).max(1);
+                    let max_scroll = lines.len().saturating_sub(inner_h);
+                    if self.header_scroll > max_scroll {
+                        self.header_scroll = max_scroll;
+                    }
+                    let inner_w = width.saturating_sub(4).max(1);
+                    let max_hscroll = lines
+                        .iter()
+                        .map(|l| l.width().saturating_sub(inner_w))
+                        .max()
+                        .unwrap_or(0);
+                    if self.header_hscroll > max_hscroll {
+                        self.header_hscroll = max_hscroll;
+                    }
+                    let popup = screen::render_popup(
+                        "HTTP headers",
+                        &lines,
+                        width,
+                        box_h,
+                        self.header_scroll,
+                        self.header_hscroll,
+                    );
+                    let y0 = content_height.saturating_sub(box_h) / 2;
+                    overlay(base, popup, y0)
+                }
+                None => base,
+            }
+        } else {
+            base
+        };
 
         let total = self.flat_html.rows.len();
         let cur = (self.focus + 1).min(total.max(1));
@@ -163,10 +301,20 @@ impl App {
             "{} hless {}│ {}{}",
             screen::FG_ACCENT, screen::FG_SEP, screen::FG_STRONG, self.filename
         );
-        let header_right = format!(
-            "{}HTML {}· {}{} rows ",
-            screen::FG_ACCENT, screen::FG_SEP, screen::FG_DIM, total
-        );
+        let header_right = if let Some(meta) = &self.headers {
+            format!(
+                "{}HTTP {}· {}{} headers ",
+                screen::FG_ACCENT,
+                screen::FG_SEP,
+                screen::FG_DIM,
+                meta.headers.len()
+            )
+        } else {
+            format!(
+                "{}HTML {}· {}{} rows ",
+                screen::FG_ACCENT, screen::FG_SEP, screen::FG_DIM, total
+            )
+        };
         let header = screen::bar(&header_left, &header_right, width, screen::BAR_BG_HEADER);
         stdout.write_all(header.as_bytes()).unwrap();
         stdout.write_all(b"\r\n").unwrap();
@@ -176,12 +324,28 @@ impl App {
 
         // Barra de estado: posición + atajos a la izquierda, porcentaje a la derecha
         let sep = format!("{} · ", screen::FG_SEP);
-        let hints = format!(
-            "{k}q{d} quit{s}{k}↑↓{d} nav{s}{k}←→{d} fold{s}{k}/{d} search",
-            k = screen::FG_KEY,
-            d = screen::FG_DIM,
-            s = sep
-        );
+        let hints = if self.show_headers {
+            format!(
+                "{k}ctrl+o{d} close{s}{k}↑↓←→{d} scroll{s}{k}esc{d} close",
+                k = screen::FG_KEY,
+                d = screen::FG_DIM,
+                s = sep
+            )
+        } else if self.headers.is_some() {
+            format!(
+                "{k}q{d} quit{s}{k}↑↓{d} nav{s}{k}←→{d} fold{s}{k}/{d} search{s}{k}ctrl+o{d} headers",
+                k = screen::FG_KEY,
+                d = screen::FG_DIM,
+                s = sep
+            )
+        } else {
+            format!(
+                "{k}q{d} quit{s}{k}↑↓{d} nav{s}{k}←→{d} fold{s}{k}/{d} search",
+                k = screen::FG_KEY,
+                d = screen::FG_DIM,
+                s = sep
+            )
+        };
         let footer_left = format!(
             "{d} Row {a}{cur}{d}/{total} {sep}│ {hints} ",
             d = screen::FG_DIM,
@@ -191,7 +355,16 @@ impl App {
             sep = screen::FG_SEP,
             hints = hints
         );
-        let footer = if let Some(input) = &self.search_input {
+        let footer = if self.show_headers {
+            let left = format!(
+                " {a}HTTP headers{d} {s}│ {hints} ",
+                a = screen::FG_ACCENT,
+                d = screen::FG_DIM,
+                s = screen::FG_SEP,
+                hints = hints
+            );
+            screen::bar(&left, "", width, screen::BAR_BG_FOOTER)
+        } else if let Some(input) = &self.search_input {
             // Modo entrada: prompt con el texto y el cursor
             let left = format!(
                 " {a}/{d} {h}{input}{reset}▏ ",
@@ -476,6 +649,46 @@ fn page_move(len: usize, start: usize, focus: usize, h: usize, down: bool) -> (u
     }
 }
 
+/// Superpone `popup` (varias líneas) sobre `base` a partir de la fila `y0`.
+fn overlay(base: String, popup: String, y0: usize) -> String {
+    let mut base_lines: Vec<&str> = base.split("\r\n").collect();
+    if base_lines.last() == Some(&"") {
+        base_lines.pop();
+    }
+    let popup_lines: Vec<&str> = {
+        let mut v: Vec<&str> = popup.split("\r\n").collect();
+        if v.last() == Some(&"") {
+            v.pop();
+        }
+        v
+    };
+    for (i, line) in popup_lines.iter().enumerate() {
+        if let Some(slot) = base_lines.get_mut(y0 + i) {
+            *slot = line;
+        }
+    }
+    let mut out = base_lines.join("\r\n");
+    out.push_str("\r\n");
+    out
+}
+
+/// Convierte las cabeceras HTTP en líneas del popup (clave/valor coloreados).
+fn header_lines(meta: &HttpHeaders) -> Vec<screen::PopupLine> {
+    let mut lines = Vec::with_capacity(meta.headers.len() + 1);
+    lines.push(screen::PopupLine::Text(meta.status_line.clone()));
+    for (name, value) in &meta.headers {
+        if value.is_empty() {
+            lines.push(screen::PopupLine::Text(name.clone()));
+        } else {
+            lines.push(screen::PopupLine::Kv {
+                key: name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    lines
+}
+
 /// Traduce los bytes leídos a una tecla. Los caracteres imprimibles se
 /// devuelven como `Char` (la acción depende del modo: navegación o búsqueda);
 /// el resto son teclas de control/flechas. Tolera que lleguen varias teclas
@@ -507,6 +720,7 @@ fn decode_key(bytes: &[u8]) -> Option<Key> {
     match bytes[0] {
         b'\r' | b'\n' => Some(Key::Enter),
         0x7f | 0x08 => Some(Key::Backspace),
+        0x0f => Some(Key::ToggleHeaders), // Ctrl+O
         0x06 => Some(Key::PageDown), // Ctrl-f
         0x02 => Some(Key::PageUp),   // Ctrl-b
         0x0e => Some(Key::Down),     // Ctrl-n
@@ -534,6 +748,7 @@ enum Key {
     Enter,
     Backspace,
     Escape,
+    ToggleHeaders,
 }
 
 #[derive(Debug)]
@@ -560,6 +775,7 @@ mod tests {
         assert!(matches!(decode_key(b"\x1b"), Some(Key::Escape)));
         assert!(matches!(decode_key(b"\r"), Some(Key::Enter)));
         assert!(matches!(decode_key(b"\x7f"), Some(Key::Backspace)));
+        assert!(matches!(decode_key(b"\x0f"), Some(Key::ToggleHeaders))); // Ctrl+O
         assert!(matches!(decode_key(b"q"), Some(Key::Char('q'))));
         assert!(matches!(decode_key(b"/"), Some(Key::Char('/'))));
         // UTF-8 multibyte (é = 0xC3 0xA9)
@@ -645,6 +861,28 @@ mod tests {
 
         app.page(h, false);
         assert_eq!(screen_row(&app), 8, "el cursor conserva su fila al retroceder página");
+    }
+
+    #[test]
+    fn headers_popup_toggles_and_closes() {
+        let mut app = App::new("<p>x</p>", "t").unwrap();
+        app.set_headers(
+            HttpHeaders {
+                status_line: "HTTP/2 200".to_string(),
+                headers: vec![("content-type".to_string(), "text/html".to_string())],
+            },
+            false,
+        );
+        assert!(!app.show_headers);
+        app.handle_key(Key::ToggleHeaders);
+        assert!(app.show_headers, "Ctrl+O abre el popup");
+        app.handle_key(Key::Down);
+        app.handle_key(Key::Escape);
+        assert!(!app.show_headers, "Esc cierra el popup");
+        // Sin cabeceras, Ctrl+O no hace nada
+        let mut plain = App::new("<p>x</p>", "t").unwrap();
+        plain.handle_key(Key::ToggleHeaders);
+        assert!(!plain.show_headers);
     }
 
     #[test]

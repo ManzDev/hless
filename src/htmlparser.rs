@@ -61,6 +61,21 @@ pub fn parse_html(html: &str) -> Result<HtmlNode, String> {
     Ok(root)
 }
 
+/// Indica si el árbol contiene al menos una etiqueta real (no solo el nodo
+/// `root` sintético ni texto suelto). Sirve para validar la entrada.
+pub fn has_real_element(node: &HtmlNode) -> bool {
+    match node {
+        HtmlNode::Element { tag, children, .. } => {
+            if tag != "root" {
+                true
+            } else {
+                children.iter().any(has_real_element)
+            }
+        }
+        _ => false,
+    }
+}
+
 struct HtmlParser {
     chars: Vec<char>,
     pos: usize,
@@ -443,6 +458,18 @@ impl HtmlParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_real_element_detects_tags() {
+        let doc = parse_html("<p>x</p>").unwrap();
+        assert!(has_real_element(&doc));
+        let text = parse_html("solo texto").unwrap();
+        assert!(!has_real_element(&text));
+        let empty = parse_html("").unwrap();
+        assert!(!has_real_element(&empty));
+        let multi = parse_html("texto <p>x</p> texto").unwrap();
+        assert!(has_real_element(&multi));
+    }
 
     #[test]
     fn test_closing_tags_produce_siblings() {

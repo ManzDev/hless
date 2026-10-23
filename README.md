@@ -1,11 +1,13 @@
 # hless
 
-Un visualizador de terminal para archivos HTML con folding anidado por etiquetas, inspirado en `jless` para JSON.
+Un visualizador de terminal para archivos HTML con folding anidado por etiquetas (inspirado en `jless` para JSON)
 
 ## Instalación
 
 ```bash
-cargo install hless
+cargo install --git https://github.com/manzdev/hless
+
+hless --version
 ```
 
 ## Uso
@@ -16,21 +18,24 @@ hless archivo.html
 
 # Ver stdin
 cat archivo.html | hless
-hless -
 
-# Ayuda y versión
-hless            # sin argumentos (y sin stdin por pipe) muestra la ayuda
+# Ayuda
 hless --help
-hless --version
+
+# Respuestas HTTP: cabeceras + cuerpo, o solo cabeceras
+curl -i https://manz.dev/ | hless    # Ctrl+O muestra las cabeceras
+curl -I https://manz.dev/ | hless
+
+# Forzar contenido que no parece HTML
+hless --force notas.txt
 ```
 
-Si la entrada llega por un pipe (`cat ... | hless`, `curl ... | hless`) pero la
-salida es un terminal, el teclado se lee de `/dev/tty`, así que la TUI sigue
-siendo interactiva. Si la salida **no** es un terminal, se vuelca el HTML tal
-cual (útil para redirigir a un fichero o encadenar con `less`).
+En principio, `hless` comprueba que la entrada parece HTML. Si no, muestra un error. Usa `--force` si quieres obligarlo a leer el código.
 
 ## Características
 
+- **Detección de HTML**: valida que la entrada sea HTML antes de abrir la TUI
+- **Cabeceras HTTP**: si vienes de `curl -i`/`-I`, se parsean y se muestran en un popup (`Ctrl+O`)
 - **Folding anidado**: Colapsa y expande etiquetas HTML anidadas
 - **Indentación por nivel**: Muestra la estructura del DOM con indentación visual
 - **Resaltado de colores**: Diferentes colores para etiquetas, atributos y texto
@@ -41,22 +46,10 @@ cual (útil para redirigir a un fichero o encadenar con `less`).
   - `Space` / `f` / `PageDown`: Avanzar una página (el cursor mantiene su línea)
   - `b` / `PageUp`: Retroceder una página
   - `g` / `G`: Ir al inicio/final
+  - `Ctrl+O`: Mostrar/ocultar las cabeceras HTTP (si las hay). Dentro del popup: `↑↓`/`j`/`k` scroll vertical, `←→`/`h`/`l` scroll horizontal, `Esc` cierra
   - `/`: Buscar (incremental; `Enter` confirma, `Esc` cancela)
   - `n` / `N`: Siguiente / anterior coincidencia
   - `q`: Salir
-
-## Ejemplo de salida
-
-```
- hless │ test.html                                          HTML · 25 rows
-    <!DOCTYPE html>
-▶ ▸ <html lang="es"> [...]
- Row 2/25 │ q quit · ↑↓ nav · ←→ fold                             8%
-```
-
-La barra superior y la de estado usan fondo a todo el ancho. `▸` marca un nodo
-plegado (pulsa `→` para desplegarlo y descubrir el siguiente nivel) y `▾` uno
-desplegado; `▶` es la fila con el foco.
 
 ## Dependencias
 
@@ -69,22 +62,17 @@ desplegado; `▶` es la fila con el foco.
 | Característica | jless | hless |
 |----------------|-------|-------|
 | Formato | JSON | HTML |
-| Folding | ✓ | ✓ |
-| Colores | ✓ | ✓ |
-| Navegación | ✓ | ✓ |
-| Búsqueda | ✓ | ✓ |
+| Folding | ✅ | ✅ |
+| Colores | ✅ | ✅ |
+| Navegación | ✅ | ✅ |
+| Búsqueda | ✅ | ✅ |
 
 ## Desarrollo
 
 ```bash
-# Clonar y construir
 git clone https://github.com/manz/hless.git
 cd hless
 cargo build --release
-
-# Instalar
-cargo install --path .
-```
 
 ## License
 
