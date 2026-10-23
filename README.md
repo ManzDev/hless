@@ -2,6 +2,8 @@
 
 Un visualizador de terminal para archivos HTML con folding anidado por etiquetas (inspirado en `jless` para JSON)
 
+![hless: interactive HTML viewer](hless.gif)
+
 ## Instalación
 
 ```bash
