@@ -1,6 +1,6 @@
 # hless
 
-Un visualizador de terminal para archivos HTML con folding anidado por etiquetas (inspirado en `jless` para JSON)
+Un visualizador de código HTML vía terminal, con soporte de folding (anidado) por etiquetas e inspirado en `jless` para JSON.
 
 ![hless: interactive HTML viewer](hless.gif)
 
@@ -15,18 +15,13 @@ hless --version
 ## Uso
 
 ```bash
-# Ver un archivo HTML
+# Ver archivo HTML
 hless archivo.html
-
-# Ver stdin
 cat archivo.html | hless
 
-# Ayuda
-hless --help
-
-# Respuestas HTTP: cabeceras + cuerpo, o solo cabeceras
-curl -i https://manz.dev/ | hless    # Ctrl+O muestra las cabeceras
+# Acceder a una web y visualizar su código
 curl -I https://manz.dev/ | hless
+curl -i https://manz.dev/ | hless    # Ctrl+O muestra las cabeceras
 
 # Forzar contenido que no parece HTML
 hless --force notas.txt
@@ -69,12 +64,13 @@ En principio, `hless` comprueba que la entrada parece HTML. Si no, muestra un er
 | Navegación | ✅ | ✅ |
 | Búsqueda | ✅ | ✅ |
 
-## Desarrollo
+## Compilar
 
 ```bash
-git clone https://github.com/manz/hless.git
+git clone https://github.com/manzdev/hless.git
 cd hless
 cargo build --release
+```
 
 ## License
 
