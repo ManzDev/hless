@@ -1,0 +1,19 @@
+[package]
+name = "hless"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A command-line HTML viewer with nested folding"
+keywords = ["cli", "html", "pager", "viewer"]
+repository = "https://github.com/manzdev/hless"
+
+[dependencies]
+html5ever = "0.32"
+markup5ever = "0.40"
+termion = "2.0"
+clap = { version = "4.0", features = ["derive"] }
+isatty = "0.1"
+unicode-width = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
